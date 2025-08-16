@@ -5,8 +5,48 @@ from fastapi.responses import JSONResponse
 from paddleocr import PaddleOCR
 from typing import List
 import numpy as np
-import cv2
-import logging
+import cv2, os
+import logging, datetime
+from fastapi import Depends
+from sqlalchemy.orm import Session
+from sqlalchemy import create_engine, Column, Integer, String, Float, DateTime, JSON
+from sqlalchemy.ext.declarative import declarative_base
+from sqlalchemy.orm import sessionmaker
+
+# Use absolute path to avoid surprises
+BASE_DIR = os.path.dirname(os.path.abspath(__file__))
+DATABASE_URL = f"sqlite:///{os.path.join(BASE_DIR, 'invoices.db')}"
+
+engine = create_engine(DATABASE_URL, connect_args={"check_same_thread": False})
+SessionLocal = sessionmaker(autocommit=False, autoflush=False, bind=engine)
+
+Base = declarative_base()
+
+class Invoice(Base):
+    __tablename__ = "invoices"
+    id = Column(Integer, primary_key=True, index=True)
+    patient_name = Column(String, nullable=True)
+    invoice_date = Column(String, nullable=True)  
+    total_amount = Column(Float, nullable=True)
+    itemized_services = Column(JSON, nullable=True)  
+    handwritten_notes = Column(String, nullable=True)
+    analysis_results = Column(JSON, nullable=True)  
+    raw_text = Column(String, nullable=True)  
+    timestamp = Column(DateTime, default=datetime.datetime.utcnow)
+    user_id = Column(String, nullable=True)
+
+# Create tables
+Base.metadata.create_all(bind=engine)
+
+# Dependency
+def get_db():
+    db = SessionLocal()
+    try:
+        yield db
+    finally:
+        db.close()
+
+
 
 # Setup basic logging
 logging.basicConfig(level=logging.INFO)
@@ -134,6 +174,60 @@ def extract_text_from_pdf(file_bytes: bytes) -> List[dict]:
 # -----------------------------
 # API Endpoints
 # -----------------------------
+
+@app.post("/invoices")
+def create_invoice(invoice: dict, db: Session = Depends(get_db)):
+    new_invoice = Invoice(
+        patient_name=invoice.get("patient_name"),
+        invoice_date=invoice.get("invoice_date"),
+        total_amount=invoice.get("total_amount"),
+        itemized_services=invoice.get("itemized_services"),
+        handwritten_notes=invoice.get("handwritten_notes"),
+        analysis_results=invoice.get("analysis_results"),
+        raw_text=invoice.get("raw_text"),
+        user_id=invoice.get("user_id")
+    )
+    db.add(new_invoice)
+    db.commit()
+    db.refresh(new_invoice)
+    return {"id": new_invoice.id, "message": "Invoice stored successfully"}
+
+@app.get("/invoices")
+def get_invoices(patient_name: str = None, start_date: str = None, end_date: str = None, db: Session = Depends(get_db)):
+    query = db.query(Invoice)
+    if patient_name:
+        query = query.filter(Invoice.patient_name.contains(patient_name))
+    if start_date and end_date:
+        query = query.filter(Invoice.invoice_date.between(start_date, end_date))
+    print(query.all())
+    return query.all()
+
+@app.get("/invoices/{invoice_id}")
+def get_invoice(invoice_id: int, db: Session = Depends(get_db)):
+    invoice = db.query(Invoice).filter(Invoice.id == invoice_id).first()
+    print(invoice)
+    if not invoice:
+        raise HTTPException(status_code=404, detail="Invoice not found")
+    return invoice
+
+@app.put("/invoices/{invoice_id}")
+def update_invoice(invoice_id: int, updated: dict, db: Session = Depends(get_db)):
+    invoice = db.query(Invoice).filter(Invoice.id == invoice_id).first()
+    if not invoice:
+        raise HTTPException(status_code=404, detail="Invoice not found")
+    for key, value in updated.items():
+        setattr(invoice, key, value)
+    db.commit()
+    return {"message": "Invoice updated"}
+
+@app.delete("/invoices/{invoice_id}")
+def delete_invoice(invoice_id: int, db: Session = Depends(get_db)):
+    invoice = db.query(Invoice).filter(Invoice.id == invoice_id).first()
+    if not invoice:
+        raise HTTPException(status_code=404, detail="Invoice not found")
+    db.delete(invoice)
+    db.commit()
+    return {"message": "Invoice deleted"}
 
 @app.post("/extract-for-llm")
 async def extract_for_llm(file: UploadFile = File(...)):
@@ -278,34 +372,6 @@ def root():
         },
         "recommendation": "Use /extract-for-llm for cleaner text suitable for LLM processing"
     }
-
-@app.get("/test")
-def test_ocr():
-    """Simple test to check if OCR is working."""
-    try:
-        # Create a simple test image with text
-        import numpy as np
-        test_img = np.ones((100, 300, 3), dtype=np.uint8) * 255  # White background
-        cv2.putText(test_img, "Hello World", (20, 50), cv2.FONT_HERSHEY_SIMPLEX, 1, (0, 0, 0), 2)
-        
-        # Convert to bytes
-        _, img_encoded = cv2.imencode('.png', test_img)
-        img_bytes = img_encoded.tobytes()
-        
-        # Test OCR
-        result = extract_text_from_image_bytes(img_bytes)
-        
-        return {
-            "test_status": "✅ Success" if result else "❌ Failed",
-            "ocr_working": bool(result),
-            "test_result": result
-        }
-        
-    except Exception as e:
-        return {
-            "test_status": "❌ Error",
-            "error": str(e)
-        }
 
 if __name__ == "__main__":
     import uvicorn
